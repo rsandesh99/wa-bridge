@@ -3,19 +3,36 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// The signing key is supplied by the build (GitHub secret), never stored in the repo.
+val releaseKeystore = file("release.keystore")
+
 android {
     namespace = "com.amclub.wabridge"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.amclub.wabridge"
+        applicationId = "com.amclub.birbal"
         minSdk = 26
         targetSdk = 34
         versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-        versionName = "1.0." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
+        versionName = "1.1." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
+    }
+
+    signingConfigs {
+        if (releaseKeystore.exists()) {
+            create("birbal") {
+                storeFile = releaseKeystore
+                storePassword = System.getenv("SIGNING_PASSWORD")
+                keyAlias = "birbal"
+                keyPassword = System.getenv("SIGNING_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
+        getByName("debug") {
+            if (releaseKeystore.exists()) signingConfig = signingConfigs.getByName("birbal")
+        }
         getByName("release") { isMinifyEnabled = false }
     }
     compileOptions {
