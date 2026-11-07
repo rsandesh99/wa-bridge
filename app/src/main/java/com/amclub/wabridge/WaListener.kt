@@ -1,9 +1,12 @@
 package com.amclub.wabridge
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.RemoteInput
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
@@ -19,6 +22,8 @@ import java.util.concurrent.TimeUnit
 /**
  * Reads WhatsApp notifications, forwards messages from unsaved numbers (and known candidates)
  * to the cloud, and sends approved replies through the notification's Reply action.
+ * Runs as a foreground service where Android allows it, so aggressive OEM battery managers
+ * (Xiaomi, Oppo, etc.) don't kill it.
  */
 class WaListener : NotificationListenerService() {
 
@@ -28,45 +33,112 @@ class WaListener : NotificationListenerService() {
         @Volatile
         var instance: WaListener? = null
         private val replyHandles = ConcurrentHashMap<String, ReplyHandle>()
+        private const val FG_ID = 77
+        private const val FG_CHANNEL = "wab_status"
 
         fun hasReplyHandle(phone: String) = replyHandles.containsKey(phone)
     }
 
     private var executor: ScheduledExecutorService? = null
-    private var lastHeartbeat = 0L
+    @Volatile private var lastHeartbeat = 0L
+    @Volatile private var lastPollStart = 0L
 
+    // ---------- lifecycle ----------
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = this
-        val ex = Executors.newSingleThreadScheduledExecutor()
-        executor = ex
-        ex.scheduleWithFixedDelay({ safePoll() }, 3, 60, TimeUnit.SECONDS)
-        // pick up anything already showing
+        Bridge.prefs(this).edit().putLong("listener_connected_at", System.currentTimeMillis()).apply()
+        Bridge.diag(this, "listener connected")
+        goForeground()
+        startExecutor()
         try {
-            activeNotifications?.forEach { handle(it) }
-        } catch (e: Exception) {
-            Log.w(Bridge.TAG, "initial scan failed", e)
+            activeNotifications?.forEach { safeHandle(it) }
+        } catch (e: Throwable) {
+            Bridge.diag(this, "initial scan failed: ${e.javaClass.simpleName}")
         }
     }
 
     override fun onListenerDisconnected() {
+        Bridge.diag(this, "listener disconnected")
         instance = null
         executor?.shutdownNow()
         executor = null
         super.onListenerDisconnected()
+        // ask Android to bind us again
+        try {
+            requestRebind(android.content.ComponentName(this, WaListener::class.java))
+        } catch (e: Throwable) { }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Started by the app's main screen (which is in the foreground, so this is allowed).
+        goForeground()
+        return START_STICKY
     }
 
     override fun onDestroy() {
+        Bridge.diag(this, "service destroyed")
         instance = null
         executor?.shutdownNow()
         super.onDestroy()
     }
 
+    private fun goForeground() {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            if (nm.getNotificationChannel(FG_CHANNEL) == null) {
+                nm.createNotificationChannel(NotificationChannel(FG_CHANNEL, "Bridge running", NotificationManager.IMPORTANCE_MIN))
+            }
+            val open = PendingIntent.getActivity(this, 5, Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            val n = Notification.Builder(this, FG_CHANNEL)
+                .setSmallIcon(android.R.drawable.sym_action_chat)
+                .setContentTitle("WA Bridge is running")
+                .setContentText("Forwarding candidate WhatsApp messages")
+                .setContentIntent(open)
+                .setOngoing(true)
+                .build()
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(FG_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(FG_ID, n)
+            }
+            Bridge.prefs(this).edit().putBoolean("fg_on", true).remove("fg_error").apply()
+        } catch (e: Throwable) {
+            Bridge.prefs(this).edit().putBoolean("fg_on", false)
+                .putString("fg_error", e.javaClass.simpleName).apply()
+            Log.w(Bridge.TAG, "foreground failed", e)
+        }
+    }
+
+    @Synchronized
+    private fun startExecutor() {
+        executor?.shutdownNow()
+        val ex = Executors.newSingleThreadScheduledExecutor()
+        executor = ex
+        ex.scheduleWithFixedDelay({ safePoll() }, 2, 60, TimeUnit.SECONDS)
+    }
+
+    /** Restart the poll loop if it has stalled (e.g. a hung network call or a killed thread). */
+    private fun watchdog() {
+        val stalled = System.currentTimeMillis() - lastPollStart > 3 * 60_000L
+        if (executor == null || executor?.isShutdown == true || stalled) {
+            Bridge.diag(this, "watchdog restarted sync loop")
+            startExecutor()
+        }
+    }
+
+    // ---------- notifications ----------
     override fun onNotificationPosted(sbn: StatusBarNotification) {
+        safeHandle(sbn)
+        watchdog()
+    }
+
+    private fun safeHandle(sbn: StatusBarNotification) {
         try {
             handle(sbn)
-        } catch (e: Exception) {
-            Log.w(Bridge.TAG, "handle failed", e)
+        } catch (e: Throwable) {
+            Bridge.diag(this, "handle error: ${e.javaClass.simpleName}")
         }
     }
 
@@ -76,22 +148,35 @@ class WaListener : NotificationListenerService() {
         val n = sbn.notification ?: return
         if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
         val extras = n.extras ?: return
-        if (extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false)) return
+        if (extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false)) {
+            Bridge.diag(this, "skip: group chat"); return
+        }
 
         val title = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
             ?: extras.getCharSequence(Notification.EXTRA_TITLE)
 
         // WhatsApp's conversation shortcut id is the chat JID, e.g. 919913009659@s.whatsapp.net
         val shortcut = n.shortcutId ?: ""
-        if (shortcut.endsWith("@g.us") || shortcut.contains("broadcast") || shortcut.contains("newsletter")) return
+        val jidType = if (shortcut.contains("@")) shortcut.substringAfter("@") else "none"
+        if (shortcut.endsWith("@g.us") || shortcut.contains("broadcast") || shortcut.contains("newsletter")) {
+            Bridge.diag(this, "skip: group/broadcast ($jidType)"); return
+        }
         var phone = if (shortcut.endsWith("@s.whatsapp.net")) Bridge.digits(shortcut.substringBefore("@")) else ""
-        val titleIsNumber = Bridge.looksLikeNumber(title)
-        if (phone.isEmpty() && titleIsNumber) phone = Bridge.digits(title)
-        if (phone.length < 8) return
+        val titleStr = title?.toString()?.trim() ?: ""
+        val titleIsNumber = Bridge.looksLikeNumber(titleStr)
+        // Unsaved contacts can also appear as "~ PushName" in newer WhatsApp versions.
+        val titleIsPushName = titleStr.startsWith("~")
+        if (phone.isEmpty() && titleIsNumber) phone = Bridge.digits(titleStr)
+        if (phone.length < 8) {
+            Bridge.diag(this, "skip: no phone (jid=$jidType, titleNumber=$titleIsNumber, pushName=$titleIsPushName)")
+            return
+        }
 
         // Rule: forward unsaved numbers, plus anyone on the candidate list even if saved.
         val known = Bridge.knownPhones(this).contains(phone)
-        if (!titleIsNumber && !known) return
+        if (!titleIsNumber && !titleIsPushName && !known) {
+            Bridge.diag(this, "skip: saved contact (jid=$jidType)"); return
+        }
 
         // Remember the Reply action so approved replies can be sent from here.
         val reply = n.actions?.firstOrNull { a -> a.remoteInputs?.isNotEmpty() == true }
@@ -112,7 +197,7 @@ class WaListener : NotificationListenerService() {
                     (Build.VERSION.SDK_INT >= 28 && b.get("sender_person") != null)
                 if (!fromOther || text.isEmpty()) continue
                 if (time <= lastTs) continue
-                out.add(msg(phone, title, text, time, reply != null))
+                out.add(msg(phone, titleStr, text, time, reply != null))
                 if (time > newest) newest = time
             }
         } else {
@@ -120,21 +205,24 @@ class WaListener : NotificationListenerService() {
             if (text.isNotEmpty() && !Regex("^\\d+ new messages?$").matches(text)) {
                 val time = if (n.`when` > 0) n.`when` else System.currentTimeMillis()
                 if (time > lastTs) {
-                    out.add(msg(phone, title, text, time, reply != null))
+                    out.add(msg(phone, titleStr, text, time, reply != null))
                     newest = time
                 }
             }
         }
-        if (out.isEmpty()) return
+        if (out.isEmpty()) {
+            Bridge.diag(this, "seen +${phone.takeLast(4)}: no new messages"); return
+        }
         p.edit().putLong("ts_$phone", newest).apply()
         Bridge.enqueue(this, out)
+        Bridge.diag(this, "queued ${out.size} msg from +${phone.takeLast(4)}")
         executor?.execute { safePoll() }
     }
 
-    private fun msg(phone: String, title: CharSequence?, text: String, time: Long, canReply: Boolean) =
+    private fun msg(phone: String, title: String, text: String, time: Long, canReply: Boolean) =
         JSONObject()
             .put("phone", phone)
-            .put("chat_title", title?.toString() ?: "")
+            .put("chat_title", title)
             .put("body", text)
             .put("msg_time", time)
             .put("can_reply", canReply)
@@ -145,7 +233,7 @@ class WaListener : NotificationListenerService() {
         val h = replyHandles[phone] ?: return false
         val stillShowing = try {
             activeNotifications?.any { it.key == h.key } == true
-        } catch (e: Exception) { false }
+        } catch (e: Throwable) { false }
         if (!stillShowing) {
             replyHandles.remove(phone)
             return false
@@ -158,18 +246,22 @@ class WaListener : NotificationListenerService() {
             RemoteInput.addResultsToIntent(inputs, intent, results)
             h.action.actionIntent.send(this, 0, intent)
             replyHandles.remove(phone)
+            Bridge.diag(this, "sent reply to +${phone.takeLast(4)}")
             true
-        } catch (e: Exception) {
-            Log.w(Bridge.TAG, "reply failed", e)
+        } catch (e: Throwable) {
+            Bridge.diag(this, "reply failed: ${e.javaClass.simpleName}")
             false
         }
     }
 
+    // ---------- sync loop ----------
     private fun safePoll() {
+        lastPollStart = System.currentTimeMillis()
+        Bridge.prefs(this).edit().putLong("listener_alive", lastPollStart).apply()
         try {
             poll()
-        } catch (e: Exception) {
-            Log.w(Bridge.TAG, "poll failed", e)
+        } catch (e: Throwable) {
+            Bridge.diag(this, "sync error: ${e.javaClass.simpleName}")
         }
     }
 
@@ -183,10 +275,7 @@ class WaListener : NotificationListenerService() {
         if (now - p.getLong("contacts_at", 0L) > 30 * 60_000L) Bridge.refreshContacts(this)
 
         if (now - lastHeartbeat > 5 * 60_000L) {
-            Bridge.call(this, JSONObject().put("action", "heartbeat")
-                .put("device", Build.MODEL ?: "phone")
-                .put("listener_connected", true)
-                .put("app_version", BuildConfig.VERSION_NAME))
+            Bridge.heartbeat(this, true, "listener")
             lastHeartbeat = now
         }
 
@@ -200,22 +289,22 @@ class WaListener : NotificationListenerService() {
             val id = o.optString("id")
             val phone = o.optString("phone")
             val body = o.optString("body")
+            val nid = 2000 + ((id.toLongOrNull() ?: 0L) % 100000L).toInt()
             when (o.optString("status")) {
                 "draft" -> draftIds.add(id)
                 "approved" -> {
                     if (sendReply(phone, body)) {
                         Bridge.call(this, JSONObject().put("action", "result").put("id", id)
                             .put("status", "sent").put("method", "notification_reply"))
-                        Bridge.cancel(this, 2000 + (id.toLongOrNull() ?: 0L).toInt() % 100000)
+                        Bridge.cancel(this, nid)
                     } else if (!notified.contains(id)) {
                         val name = o.optString("name").takeIf { it.isNotEmpty() && it != "null" } ?: "+$phone"
                         val tap = Intent(this, SendActivity::class.java)
                             .putExtra("id", id).putExtra("phone", phone).putExtra("body", body)
                             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        val pi = PendingIntent.getActivity(this, (id.toLongOrNull() ?: 0L).toInt(), tap,
+                        val pi = PendingIntent.getActivity(this, nid, tap,
                             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-                        Bridge.notify(this, 2000 + (id.toLongOrNull() ?: 0L).toInt() % 100000,
-                            "Tap to send to $name", body, pi)
+                        Bridge.notify(this, nid, "Tap to send to $name", body, pi)
                         notified.add(id)
                         changed = true
                     }
@@ -232,9 +321,9 @@ class WaListener : NotificationListenerService() {
                 val open = PendingIntent.getActivity(this, 1,
                     Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-                val n = draftIds.size
-                Bridge.notify(this, 1000, "$n WhatsApp ${if (n == 1) "reply" else "replies"} to approve",
-                    "Claude drafted ${if (n == 1) "a reply" else "replies"} for candidates. Tap to review.", open)
+                val c = draftIds.size
+                Bridge.notify(this, 1000, "$c WhatsApp ${if (c == 1) "reply" else "replies"} to approve",
+                    "Claude drafted ${if (c == 1) "a reply" else "replies"} for candidates. Tap to review.", open)
             } else {
                 Bridge.cancel(this, 1000)
             }

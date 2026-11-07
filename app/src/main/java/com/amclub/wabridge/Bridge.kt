@@ -62,6 +62,32 @@ object Bridge {
         }
     }
 
+    // ---- on-device diagnostics (no message text; names of saved contacts are never stored) ----
+    @Synchronized
+    fun diag(ctx: Context, entry: String) {
+        val p = prefs(ctx)
+        val arr = JSONArray(p.getString("diag", "[]"))
+        val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        arr.put("$stamp $entry")
+        val out = JSONArray()
+        val start = maxOf(0, arr.length() - 15)
+        for (i in start until arr.length()) out.put(arr.get(i))
+        p.edit().putString("diag", out.toString()).apply()
+    }
+
+    fun diagList(ctx: Context): List<String> {
+        val arr = try { JSONArray(prefs(ctx).getString("diag", "[]")) } catch (e: Exception) { JSONArray() }
+        return (0 until arr.length()).map { arr.optString(it) }.reversed()
+    }
+
+    fun heartbeat(ctx: Context, listenerConnected: Boolean, source: String) {
+        call(ctx, JSONObject().put("action", "heartbeat")
+            .put("device", android.os.Build.MODEL ?: "phone")
+            .put("listener_connected", listenerConnected)
+            .put("app_version", BuildConfig.VERSION_NAME)
+            .put("diag", ("[$source] " + diagList(ctx).take(12).joinToString(" | ")).take(1800)))
+    }
+
     // ---- outgoing queue of inbound messages that failed to upload ----
     @Synchronized
     fun enqueue(ctx: Context, msgs: List<JSONObject>) {

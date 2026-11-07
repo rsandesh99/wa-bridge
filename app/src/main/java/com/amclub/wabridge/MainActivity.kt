@@ -61,8 +61,21 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        if (listenerEnabled()) {
+            // Start the listener as a regular service while we're on screen; it then promotes
+            // itself to foreground so the phone's battery manager leaves it alone.
+            try { startService(Intent(this, WaListener::class.java)) } catch (e: Throwable) { }
+            if (WaListener.instance == null) rebindListener()
+        }
         renderStatus()
         refresh()
+    }
+
+    private fun rebindListener() {
+        try {
+            android.service.notification.NotificationListenerService.requestRebind(
+                ComponentName(this, WaListener::class.java))
+        } catch (e: Throwable) { }
     }
 
     // ---------- status & setup ----------
@@ -141,6 +154,37 @@ class MainActivity : Activity() {
                 (if (code in 200..299) "" else " (error $code)") +
                 (if (queued > 0) " · $queued message(s) waiting to upload" else "")
         statusBox.addView(label(syncText).apply { setTextColor(Color.GRAY) })
+
+        // ---- diagnostics ----
+        if (listener) {
+            val alive = p.getLong("listener_alive", 0L)
+            val ageMin = if (alive == 0L) -1L else (System.currentTimeMillis() - alive) / 60000L
+            val running = WaListener.instance != null && ageMin in 0L..3L
+            statusBox.addView(check(running, "Background sync",
+                when {
+                    running -> "Running (checked ${if (ageMin == 0L) "just now" else "$ageMin min ago"})"
+                    ageMin < 0 -> "Not started yet. Tap Restart below."
+                    else -> "Stopped $ageMin min ago. Tap Restart; on Xiaomi also enable Autostart."
+                }))
+            val fgErr = p.getString("fg_error", null)
+            if (fgErr != null) statusBox.addView(label("Keep-alive notification not allowed ($fgErr)").apply { setTextColor(Color.GRAY) })
+            if (!running) statusBox.addView(button("Restart background sync") {
+                try { startService(Intent(this, WaListener::class.java)) } catch (e: Throwable) { }
+                rebindListener()
+                toast("Restarting…")
+                statusBox.postDelayed({ renderStatus() }, 3000)
+            })
+        }
+        val diag = Bridge.diagList(this)
+        if (diag.isNotEmpty()) {
+            statusBox.addView(TextView(this).apply {
+                text = "Recent activity\n" + diag.take(8).joinToString("\n")
+                textSize = 12f
+                setTextColor(Color.GRAY)
+                setPadding(0, dp(8), 0, dp(4))
+                setTextIsSelectable(true)
+            })
+        }
     }
 
     // ---------- pending replies ----------
@@ -152,6 +196,7 @@ class MainActivity : Activity() {
         }
         Thread {
             Bridge.flushQueue(this)
+            Bridge.heartbeat(this, WaListener.instance != null, "app")
             val res = Bridge.call(this, JSONObject().put("action", "pending"))
             runOnUiThread { renderList(res); renderStatus() }
         }.start()
