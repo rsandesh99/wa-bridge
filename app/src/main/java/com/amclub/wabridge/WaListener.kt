@@ -93,8 +93,8 @@ class WaListener : NotificationListenerService() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val n = Notification.Builder(this, FG_CHANNEL)
                 .setSmallIcon(android.R.drawable.sym_action_chat)
-                .setContentTitle("WA Bridge is running")
-                .setContentText("Forwarding candidate WhatsApp messages")
+                .setContentTitle("Birbal is running")
+                .setContentText("Watching candidate WhatsApp and your calendar")
                 .setContentIntent(open)
                 .setOngoing(true)
                 .build()
@@ -216,7 +216,10 @@ class WaListener : NotificationListenerService() {
         p.edit().putLong("ts_$phone", newest).apply()
         Bridge.enqueue(this, out)
         Bridge.diag(this, "queued ${out.size} msg from +${phone.takeLast(4)}")
+        // Upload now, then check back quickly for Birbal's decision (draft or booking).
         executor?.execute { safePoll() }
+        executor?.schedule({ safePoll() }, 20, TimeUnit.SECONDS)
+        executor?.schedule({ safePoll() }, 45, TimeUnit.SECONDS)
     }
 
     private fun msg(phone: String, title: String, text: String, time: Long, canReply: Boolean) =
@@ -279,6 +282,14 @@ class WaListener : NotificationListenerService() {
             lastHeartbeat = now
         }
 
+        // Calendar: share busy times every 10 minutes, and create any calls Birbal booked.
+        try {
+            if (now - p.getLong("calendar_synced", 0L) > 10 * 60_000L) CalendarSync.sync(this)
+            CalendarSync.applyPending(this)
+        } catch (e: Throwable) {
+            Bridge.diag(this, "calendar error: ${e.javaClass.simpleName}")
+        }
+
         val res = Bridge.call(this, JSONObject().put("action", "pending")) ?: return
         val items = res.optJSONArray("items") ?: return
         val draftIds = ArrayList<String>()
@@ -323,7 +334,7 @@ class WaListener : NotificationListenerService() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
                 val c = draftIds.size
                 Bridge.notify(this, 1000, "$c WhatsApp ${if (c == 1) "reply" else "replies"} to approve",
-                    "Claude drafted ${if (c == 1) "a reply" else "replies"} for candidates. Tap to review.", open)
+                    "Birbal drafted ${if (c == 1) "a reply" else "replies"} for candidates. Tap to review.", open)
             } else {
                 Bridge.cancel(this, 1000)
             }

@@ -36,7 +36,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        title = "WA Bridge"
+        title = "Birbal"
         val scroll = ScrollView(this)
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -53,10 +53,23 @@ class MainActivity : Activity() {
         root.addView(header("Send a new message"))
         root.addView(composeBox())
 
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        askPermissions()
+    }
+
+    private fun askPermissions() {
+        val wanted = mutableListOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR)
+        if (Build.VERSION.SDK_INT >= 33) wanted.add(Manifest.permission.POST_NOTIFICATIONS)
+        val missing = wanted.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (CalendarSync.hasPermission(this)) {
+            Bridge.prefs(this).edit().putLong("calendar_synced", 0L).apply()
+            Thread { CalendarSync.sync(this) }.start()
         }
+        renderStatus()
     }
 
     override fun onResume() {
@@ -94,7 +107,7 @@ class MainActivity : Activity() {
 
         if (!Bridge.isConfigured(this)) {
             statusBox.addView(header("Setup"))
-            statusBox.addView(label("Paste the setup code Claude gave you:"))
+            statusBox.addView(label("Paste your setup code:"))
             val input = EditText(this).apply {
                 hint = "wab_…"
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
@@ -134,6 +147,14 @@ class MainActivity : Activity() {
                 startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
             })
         }
+        val cal = CalendarSync.hasPermission(this)
+        val calSynced = p.getLong("calendar_synced", 0L)
+        statusBox.addView(check(cal, "Calendar access",
+            if (!cal) "Needed so Birbal can avoid clashes and book confirmed calls"
+            else if (calSynced == 0L) "Allowed; first sync pending"
+            else "Synced " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(calSynced))))
+        if (!cal) statusBox.addView(button("Allow calendar access") { askPermissions() })
+
         val battery = batteryOk()
         statusBox.addView(check(battery, "Battery optimisation off",
             if (battery) "The app can keep syncing in the background" else "Recommended, otherwise Android may pause syncing"))
